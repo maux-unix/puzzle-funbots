@@ -1,6 +1,10 @@
 BSD 2-Clause License
 
-Copyright (c) 2025, Maulana M. Ali
+Copyright (c) 2025, Maulana Muhammad Ali
+Copyright (c) 2025, Mohammad Amrizal Kurniansyah
+Copyright (c) 2025, Wafi Athanusa Sakti
+Copyright (c) 2025, Ananta Boemi Adji
+Copyright (c) 2025, Abdul Hanif Iskandar
 
 Redistribution and use in source and binary forms, with or without
 modification, are permitted provided that the following conditions are met:

@@ -23,4 +23,6 @@ Follow the following commands to getting started:
 conda init $SHELL
 conda env create -f environment.yml
 conda activate puzzle-funbots
+python3 puzzle_funbots_data-driven.py
+python3 puzzle_funbots_classic.py
 ```
