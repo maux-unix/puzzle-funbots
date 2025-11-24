@@ -21,6 +21,7 @@ Follow the following commands to getting started:
 
 ```shell
 conda init $SHELL
+conda config --add channels conda-forge
 conda env create -f environment.yml
 conda activate puzzle-funbots
 python3 puzzle_funbots_data-driven.py
