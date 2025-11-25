@@ -27,3 +27,16 @@ conda activate puzzle-funbots
 python3 puzzle_funbots_data-driven.py
 python3 puzzle_funbots_classic.py
 ```
+
+## For ILC + NN
+
+```shell
+conda init $SHELL
+conda config --add channels conda-forge
+conda create -n funbots_baru python=3.10
+conda activate funbots_baru
+conda install pybullet
+pip install numpy matplotlib
+conda install intel-openmp
+pip install torch torchvision torchaudio
+```
