@@ -2,10 +2,12 @@ name: puzzle-funbots
 channels:
   - conda-forge
 dependencies:
-  - python=3.13
+  - python=3.10
   - numpy
   - matplotlib
-  - pybullet
   - pip
   - pip:
       - requests
+      - torch 
+      - torchvision
+      - raylib

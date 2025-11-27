@@ -1,6 +1,6 @@
 # Puzzle-Funbots Robotic Arm Simulation
 
-This repository contains the robotic arm simulation that solves 4x4 puzzle.
+This repository contains the robotic arm simulation that solves 3x3 puzzle.
 It is our project for *Data-driven Control System* college class.
 
 ## Overview
@@ -14,6 +14,7 @@ Make sure you have the following softwares installed on your system:
 - Anaconda
 - Python 3.13+
 - ipykernel (install with pip)
+- Raylib
 
 ## Getting Started
 
@@ -24,19 +25,6 @@ conda init $SHELL
 conda config --add channels conda-forge
 conda env create -f environment.yml
 conda activate puzzle-funbots
-python3 puzzle_funbots_data-driven.py
-python3 puzzle_funbots_classic.py
 ```
 
-## For ILC + NN
-
-```shell
-conda init $SHELL
-conda config --add channels conda-forge
-conda create -n funbots_baru python=3.10
-conda activate funbots_baru
-conda install pybullet
-pip install numpy matplotlib
-conda install intel-openmp
-pip install torch torchvision torchaudio
-```
+Now you can train & test the model :3
