@@ -7,6 +7,11 @@ import torch.nn as nn
 import torch.optim as optim
 import os
 
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
+#device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+device = "cpu"
+print("Using device:", device)
+
 # --- KONFIGURASI DASAR ---
 SCREEN_WIDTH = 800
 SCREEN_HEIGHT = 600
@@ -14,7 +19,7 @@ BASE_POS = (400, 300)            # Robot di tengah layar
 PIXELS_PER_METER = 180.0        # Skala dunia -> layar
 
 # Penyimpanan model
-MODEL_BEST_PATH   = "ilc_3x3_best.pth"     # model dengan skor terbaik
+MODEL_BEST_PATH   = "ilc_3x3_best.pth"     # model dengan skor terbaik (global)
 MODEL_LATEST_PATH = "ilc_3x3_latest.pth"   # model terakhir
 
 # --- FISIKA DEADZONE (KOTAK PEMBATAS) ---
@@ -24,7 +29,7 @@ SAFE_MIN_Y = -0.8  # Lantai
 SAFE_MAX_Y = 1.5   # Atap
 
 # --- KECEPATAN SIMULASI ---
-SPEED_LEVELS = [1, 2, 5, 10, 20, 50, 100]
+SPEED_LEVELS = [1, 2, 5, 10, 20, 50, 100, 1000, 5000, 10000]
 
 # Fisika Robot
 LINK_1 = 1.2
@@ -47,6 +52,10 @@ COLORS_NUM = [
     (255, 255, 100, 255), (100, 255, 255, 255), (255, 100, 255, 255),
     (255, 150, 50, 255),  (50, 255, 150, 255),  (150, 50, 255, 255)
 ]
+
+# skor teori: 9 cube * max 100
+MAX_SCORE_THEORETICAL = 9 * 100.0
+THRESHOLD_PUZZLE = 0.9 * MAX_SCORE_THEORETICAL  # 90% dari skor maksimal
 
 
 # --- 1. NEURAL NETWORK ---
@@ -144,7 +153,7 @@ def apply_physical_constraints(theta1, theta2):
 
 hist_error = []  # average positional error per iteration
 
-def draw_error_plot(hist_error, best_score):
+def draw_error_plot(hist_error):
     """Plot sederhana error gerakan per iterasi di pojok kiri bawah."""
     if not hist_error:
         return
@@ -212,22 +221,23 @@ def generate_valid_sudoku_3x3():
 def main():
     global hist_error
 
-    rl.init_window(SCREEN_WIDTH, SCREEN_HEIGHT, "Neural Sudoku 3x3 (NN + Error Plot)")
+    rl.init_window(SCREEN_WIDTH, SCREEN_HEIGHT, "Neural Sudoku 3x3 (NN + Error Plot + 0.9 Threshold)")
     rl.set_target_fps(60)
 
-    net = PuzzleNet()
+    net = PuzzleNet().to(device)
     optimizer = optim.Adam(net.parameters(), lr=LEARNING_RATE)
     criterion = nn.MSELoss()
 
-    best_score = -1.0
+    # global best score (semua layout)
+    global_best_score = -1.0
 
     # Load model terbaik kalau ada
     if os.path.exists(MODEL_BEST_PATH):
         try:
             ckpt = torch.load(MODEL_BEST_PATH)
             net.load_state_dict(ckpt['model'])
-            best_score = ckpt.get('score', -1.0)
-            print(f"Brain Loaded (BEST). Best Score: {best_score:.1f}")
+            global_best_score = ckpt.get('score', -1.0)
+            print(f"Brain Loaded (BEST). Global Best Score: {global_best_score:.1f}")
         except Exception as e:
             print("Failed to load best model:", e)
 
@@ -247,10 +257,17 @@ def main():
     sum_err_iter = 0.0
     step_count_iter = 0
 
-    # --- LAYOUT SUDOKU TETAP PER RUN (BIAR BISA MEMBENARKAN DI LEVEL YANG SAMA) ---
-    # Kalau mau layout ganti setiap iterasi, tinggal generate ulang di reset_level().
-    left_vals_global = generate_valid_sudoku_3x3()
+    # --- LAYOUT SUDOKU GLOBAL YANG AKAN DIGANTI KALAU SUDAH >= 0.9 * MAX ---
+    left_vals_global  = generate_valid_sudoku_3x3()
     right_vals_global = generate_valid_sudoku_3x3()
+    puzzle_best_score = -1.0  # best score khusus layout ini
+
+    def regenerate_puzzle():
+        nonlocal left_vals_global, right_vals_global, puzzle_best_score
+        left_vals_global  = generate_valid_sudoku_3x3()
+        right_vals_global = generate_valid_sudoku_3x3()
+        puzzle_best_score = -1.0
+        print("New Sudoku Layout Generated (layout baru, lanjut belajar).")
 
     def reset_level():
         c_list = []
@@ -329,7 +346,7 @@ def main():
     joint_traj = []
     grip_sched = []
 
-    # --- GENERATOR LINTASAN (TEACHER TRAJECTORY, HANYA SEBAGAI LABEL) ---
+    # --- GENERATOR LINTASAN (TEACHER TRAJECTORY, HANYA LABEL) ---
     def generate_dynamic_trajectory(current_hand_pos, pickup_pos, drop_pos):
         traj = []
         grip = []
@@ -375,8 +392,6 @@ def main():
 
         return np.array(traj), grip
 
-    MAX_SCORE_THEORETICAL = 9 * 100.0  # 9 cube * max 100
-
     # --- MAIN LOOP ---
     while not rl.window_should_close():
         # speed control
@@ -418,14 +433,16 @@ def main():
 
                     nn_in = torch.tensor(
                         [norm_step, target_id_norm, 0.0, 0.0],
-                        dtype=torch.float32
+                        dtype=torch.float32,
+                        device=device
                     ).unsqueeze(0)  # (1,4)
 
                     net.eval()
                     with torch.no_grad():
-                        cmd_abs = net(nn_in).numpy()[0]  # (2,)
+                        out = net(nn_in)
+                        cmd_abs = out.cpu().numpy()[0]  # (2,)
 
-                    # Kumpulkan data teacher (supervised) untuk perbaikan ILC
+                    # Kumpulkan data teacher (supervised)
                     train_X.append([norm_step, target_id_norm, 0.0, 0.0])
                     train_Y.append(ideal_theta_label)
 
@@ -474,15 +491,15 @@ def main():
 
                     path_idx += 1
 
-                # Fallback: path habis tapi cube belum DONE -> anggap gagal, tapi terus jalan
+                # Fallback: path habis tapi cube belum DONE -> skor 0
                 elif active_idx != -1 and path_idx >= len(joint_traj):
                     if cubes[active_idx]["state"] != "DONE":
                         last_cube_val = cubes[active_idx]["val"]
-                        last_cube_score = 0.0  # gagal, skor 0
+                        last_cube_score = 0.0
                     active_idx = -1
                     path_idx = 0
 
-            # ====== FASE TRAINING (MEMBENARKAN PER ITERASI) ======
+            # ====== FASE TRAINING ======
             else:
                 train_timer += 1
                 delay = 60 if speed == 1 else 1
@@ -490,8 +507,8 @@ def main():
                     avg_err_iter = sum_err_iter / max(1, step_count_iter)
 
                     if len(train_X) > 0:
-                        inp = torch.tensor(np.array(train_X), dtype=torch.float32)
-                        lbl = torch.tensor(np.array(train_Y), dtype=torch.float32)
+                        inp = torch.tensor(np.array(train_X), dtype=torch.float32, device=device)
+                        lbl = torch.tensor(np.array(train_Y), dtype=torch.float32, device=device)
 
                         net.train()
                         nan_detected = False
@@ -516,6 +533,14 @@ def main():
                             # Catat error iterasi ini
                             hist_error.append(avg_err_iter)
 
+                            # Update best score untuk layout ini
+                            nonlocal_puzzle_best = total_score_iter
+                            # python nggak boleh assign langsung outer var di scope ini,
+                            # jadi kita pakai closure-style: update lewat list atau nonlocal.
+                            # Tapi karena kita di body main(), kita bisa pakai nonlocal di atas:
+                            # di sini, workaround sederhana:
+                            # kita simpan total_score_iter dulu, lalu di luar if kita assign.
+
                             # Simpan model terakhir
                             latest_state = {
                                 'model': net.state_dict(),
@@ -525,27 +550,32 @@ def main():
                             }
                             torch.save(latest_state, MODEL_LATEST_PATH)
 
-                            # Update & simpan model terbaik (berdasarkan skor)
-                            if total_score_iter > best_score:
-                                best_score = total_score_iter
+                            # Update & simpan model terbaik (global)
+                            if total_score_iter > global_best_score:
+                                global_best_score = total_score_iter
                                 best_state = {
                                     'model': net.state_dict(),
-                                    'score': best_score,
+                                    'score': global_best_score,
                                     'iteration': iteration,
                                     'avg_error': avg_err_iter,
                                 }
                                 torch.save(best_state, MODEL_BEST_PATH)
-                                save_msg = f"NEW BEST! Score: {best_score:.1f}"
+                                save_msg = f"NEW GLOBAL BEST! Score: {global_best_score:.1f}"
                                 save_col = rl.GREEN
                             else:
                                 save_msg = f"Learning... (S:{total_score_iter:.1f}, E:{avg_err_iter:.4f})"
                                 save_col = rl.ORANGE
 
-                            if best_score >= MAX_SCORE_THEORETICAL - 1e-3:
-                                save_msg = "PERFECT PUZZLE SOLVED!"
-                                save_col = rl.SKYBLUE
+                    # --- UPDATE puzzle_best_score & CEK THRESHOLD 0.9 ---
+                    puzzle_best_score = max(puzzle_best_score, total_score_iter)
 
-                    # Reset episode (ulang puzzle yang sama, robot makin benar)
+                    if puzzle_best_score >= THRESHOLD_PUZZLE:
+                        # Layout ini sudah >= 0.9 * max -> generate puzzle baru
+                        save_msg = f"Layout SOLVED (>=90%), new puzzle..."
+                        save_col = rl.SKYBLUE
+                        regenerate_puzzle()
+
+                    # Reset episode (mulai ulang di layout sekarang, atau sudah baru)
                     train_X, train_Y = [], []
                     total_score_iter = 0.0
                     sum_err_iter = 0.0
@@ -600,23 +630,25 @@ def main():
 
         # HUD
         rl.draw_text(f"Iter: {iteration}", 10, 10, 20, rl.WHITE)
-        rl.draw_text("(NN SELF-CORRECTING)", 200, 10, 20, rl.SKYBLUE)
+        rl.draw_text("(NN SELF-CORRECT, 0.9 THRESH)", 200, 10, 20, rl.SKYBLUE)
 
         sc_col = rl.GREEN if last_cube_score > 50 else rl.RED
         rl.draw_text(f"Cube {last_cube_val} Score: {last_cube_score:.1f}", 10, 40, 20, sc_col)
         rl.draw_text(save_msg, 10, 70, 20, save_col)
         rl.draw_text(f"Speed: {speed}x", 650, 10, 20, rl.YELLOW)
-        rl.draw_text(f"Best Score: {best_score:.1f}", 10, 100, 20, rl.LIGHTGRAY)
+        rl.draw_text(f"Global Best: {global_best_score:.1f}", 10, 100, 20, rl.LIGHTGRAY)
+        rl.draw_text(f"Puzzle Best: {puzzle_best_score:.1f}", 10, 130, 20, rl.LIGHTGRAY)
+        rl.draw_text(f"Threshold: {THRESHOLD_PUZZLE:.1f}", 10, 160, 18, rl.GRAY)
 
         # Current avg error (on-the-fly)
         cur_avg_err = sum_err_iter / max(1, step_count_iter) if step_count_iter > 0 else 0.0
-        rl.draw_text(f"Curr Avg Err: {cur_avg_err:.4f}", 10, 130, 20, rl.LIGHTGRAY)
+        rl.draw_text(f"Curr Avg Err: {cur_avg_err:.4f}", 10, 190, 18, rl.LIGHTGRAY)
 
         if training_mode:
             rl.draw_text("TRAINING WEIGHTS...", 250, 300, 30, rl.GREEN)
 
         # Plot error gerakan
-        draw_error_plot(hist_error, best_score)
+        draw_error_plot(hist_error)
 
         rl.end_drawing()
 
