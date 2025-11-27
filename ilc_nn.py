@@ -14,18 +14,13 @@ SCREEN_WIDTH = 800
 SCREEN_HEIGHT = 600
 BASE_POS = (400, 550) 
 PIXELS_PER_METER = 200.0
-MODEL_PATH = "ilc_smart_stop.pth" 
+MODEL_PATH = "ilc_online_learner.pth" 
 
 # --- GRAVITASI ---
 GRAVITY_VAL = 0.20 
 
 # --- KECEPATAN ---
 SPEED_LEVELS = [1, 2, 5, 10, 20, 50, 100]
-
-# --- PARAMETER BARU ---
-EARLY_STOP_THRESHOLD = 0.00005  # Jika error di bawah ini, stop training (sudah pintar)
-ACCEPTABLE_LOSS = 0.002         # Batas toleransi untuk menyimpan model "Cukup Bagus"
-SLOT_RADIUS = 0.06              # Setengah lebar slot (batas aman border)
 
 # Fisika Robot
 LINK_1 = 1.2 
@@ -102,62 +97,68 @@ def apply_gravity_disturbance(theta1, theta2):
 
 # --- 3. DASHBOARD VISUALIZATION ---
 plt.ion()
-fig = plt.figure(figsize=(10, 8))
+fig = plt.figure(figsize=(12, 9))
 gs = GridSpec(2, 2, figure=fig)
 
 ax_loss = fig.add_subplot(gs[0, 0])
 ax_score = fig.add_subplot(gs[0, 1])
-ax_cm = fig.add_subplot(gs[1, :])
+ax_cm_curr = fig.add_subplot(gs[1, 0]) # Bawah Kiri (Current)
+ax_cm_total = fig.add_subplot(gs[1, 1]) # Bawah Kanan (Total)
 
 history_loss = []
 history_score = []
-# Matrix Terbaik Global
-best_display_matrix = np.zeros((3, 3), dtype=int) 
 
-def update_dashboard(curr_iter, best_loss_val):
-    ax_loss.clear(); ax_score.clear(); ax_cm.clear()
+def draw_confusion_matrix(ax, matrix, title, cmap='Blues'):
+    ax.clear()
+    im = ax.imshow(matrix, cmap=cmap, vmin=0)
+    total = np.sum(matrix)
+    acc = 0
+    if total > 0: acc = np.trace(matrix) / total * 100.0
     
+    ax.set_title(f"{title}\n(Acc: {acc:.1f}%, N={total})")
+    ax.set_xticks(np.arange(3)); ax.set_yticks(np.arange(3))
+    ax.set_xticklabels(COLOR_NAMES); ax.set_yticklabels(COLOR_NAMES)
+    ax.set_xlabel("Prediksi"); ax.set_ylabel("Aktual")
+    
+    for i in range(3):
+        for j in range(3):
+            count = matrix[i, j]
+            col = "white" if count > (np.max(matrix)/2) else "black"
+            ax.text(j, i, str(count), ha="center", va="center", color=col, fontweight='bold')
+
+def update_dashboard(curr_iter, best_score_val, current_matrix, total_matrix):
+    # 1. Loss Plot
+    ax_loss.clear()
     if history_loss:
-        ax_loss.plot(history_loss, color='red', label='Per-Cube Loss')
-        ax_loss.axhline(y=EARLY_STOP_THRESHOLD, color='blue', linestyle=':', label='Early Stop')
-        ax_loss.axhline(y=best_loss_val, color='green', linestyle='--', label='Best Record')
-        ax_loss.set_title("Training Loss & Thresholds")
-        ax_loss.legend(loc='upper right')
-        ax_loss.set_yscale('log') # Pakai skala log biar kelihatan detail kecil
+        ax_loss.plot(history_loss, color='red')
+        ax_loss.set_title("Training Loss")
         ax_loss.grid(True, alpha=0.3)
 
+    # 2. Score Plot
+    ax_score.clear()
     if history_score:
-        ax_score.plot(history_score, color='blue', marker='o', linestyle='none', markersize=2)
+        ax_score.plot(history_score, color='blue', marker='o')
+        ax_score.axhline(y=best_score_val, color='gold', linestyle='--')
         ax_score.set_title("Score Per Cube")
         ax_score.set_ylim(0, 105)
         ax_score.grid(True, alpha=0.3)
 
-    im = ax_cm.imshow(best_display_matrix, cmap='Greens', vmin=0)
-    total_samples = np.sum(best_display_matrix)
-    accuracy = 0
-    if total_samples > 0:
-        accuracy = np.trace(best_display_matrix) / total_samples * 100.0
-        
-    ax_cm.set_title(f"Best Confusion Matrix (Acc: {accuracy:.1f}%)")
-    ax_cm.set_xticks(np.arange(3)); ax_cm.set_yticks(np.arange(3))
-    ax_cm.set_xticklabels(COLOR_NAMES); ax_cm.set_yticklabels(COLOR_NAMES)
-    ax_cm.set_xlabel("Prediksi"); ax_cm.set_ylabel("Aktual")
-    
-    for i in range(3):
-        for j in range(3):
-            count = best_display_matrix[i, j]
-            pct = 0.0
-            row_sum = np.sum(best_display_matrix[i, :])
-            if row_sum > 0: pct = (count / row_sum) * 100.0
-            text_label = f"{count}\n({pct:.0f}%)"
-            ax_cm.text(j, i, text_label, ha="center", va="center", color="black", fontsize=10)
+    # 3. Current Matrix
+    draw_confusion_matrix(ax_cm_curr, current_matrix, f"Current Iteration ({curr_iter})", cmap='Blues')
+
+    # 4. Total Matrix
+    draw_confusion_matrix(ax_cm_total, total_matrix, "Total Accumulation", cmap='Greens')
             
     plt.tight_layout()
     plt.pause(0.001)
+    
+    # Save plot gambar
+    if not os.path.exists("training_logs"): os.makedirs("training_logs")
+    plt.savefig(f"training_logs/plot_iter_{curr_iter}.png")
 
 # --- 4. LOGIKA GAME ---
 def main():
-    rl.init_window(SCREEN_WIDTH, SCREEN_HEIGHT, "2D ILC (Early Stop + Smart Save)")
+    rl.init_window(SCREEN_WIDTH, SCREEN_HEIGHT, "2D ILC (Dual Matrix)")
     rl.set_target_fps(60)
     
     net = ILCNetwork()
@@ -165,38 +166,36 @@ def main():
     criterion = nn.MSELoss()
     
     best_loss = float('inf')
+    best_score = -1.0
     
-    # Load Model
-    global best_display_matrix
     if os.path.exists(MODEL_PATH):
         try:
             checkpoint = torch.load(MODEL_PATH)
             net.load_state_dict(checkpoint['model_state_dict'])
             best_loss = checkpoint.get('best_loss', float('inf'))
-            best_display_matrix = np.array(checkpoint.get('best_cm', np.zeros((3,3))))
+            best_score = checkpoint.get('best_score', -1.0)
             net.eval()
-            print(f"Model Loaded. Best Loss: {best_loss:.5f}")
-        except Exception as e:
-            print(f"Error loading: {e}")
+            print(f"Model Loaded. Best Score: {best_score:.1f}")
+        except: pass
     
     curr_theta = np.array([math.pi / 2, 0.0])
     
-    # Data Buffer Per Kubus
     cube_data_X = []
     cube_data_Y = []
     
+    # DUA MATRIX BERBEDA
     current_iter_matrix = np.zeros((3, 3), dtype=int)
+    total_confusion_matrix = np.zeros((3, 3), dtype=int)
     
     iteration = 1
+    total_score_iter = 0
     speed_level_index = 0
     speed_multiplier = SPEED_LEVELS[speed_level_index]
     
     save_msg = "Ready"
     save_col = rl.GRAY
     
-    # Variabel untuk validasi posisi akhir kubus
-    last_final_pos = [0,0]
-    last_target_pos = [0,0]
+    current_cube_score = 0.0
     
     def reset_level():
         c_list = []
@@ -242,7 +241,8 @@ def main():
         pts.append(end_xy)
         return pts
 
-    update_dashboard(iteration, best_loss)
+    # Initial Plot
+    update_dashboard(iteration, best_score, current_iter_matrix, total_confusion_matrix)
 
     while not rl.window_should_close():
         
@@ -254,6 +254,7 @@ def main():
         
         for _ in range(speed_multiplier):
             
+            # --- TRAINING PHASE ---
             if is_training_moment:
                 train_moment_timer += 1
                 if train_moment_timer > 5:
@@ -263,71 +264,52 @@ def main():
                         
                         net.train()
                         current_cube_loss = 0
-                        
-                        # --- EARLY STOPPING LOGIC ---
-                        # Train max 30 epoch, tapi stop jika error sudah sangat kecil
-                        for epoch in range(30):
+                        for _ in range(20):
                             optimizer.zero_grad()
                             out = net(inp)
                             loss = criterion(out, tgt)
                             loss.backward()
                             optimizer.step()
                             current_cube_loss = loss.item()
-                            
-                            if current_cube_loss < EARLY_STOP_THRESHOLD:
-                                # Stop training loop ini
-                                break
                         
                         history_loss.append(current_cube_loss)
+                        history_score.append(current_cube_score)
                         
-                        # --- SAVING LOGIC (RELAXED) ---
-                        # 1. Hitung jarak fisik kubus ke target
-                        dist_phys = math.sqrt((last_final_pos[0] - last_target_pos[0])**2 + 
-                                              (last_final_pos[1] - last_target_pos[1])**2)
+                        # LOGIKA SAVE
+                        is_new_best = False
+                        reason = ""
+                        if current_cube_score > best_score:
+                            is_new_best = True
+                            reason = f"New Best Score! ({current_cube_score:.1f})"
+                        elif current_cube_score == best_score and current_cube_loss < best_loss:
+                            is_new_best = True
+                            reason = f"Lower Loss ({current_cube_loss:.5f})"
                         
-                        # Apakah kubus masuk dalam radius toleransi (meski mepet pinggir)?
-                        is_physically_good = dist_phys < SLOT_RADIUS
-                        
-                        # Logic Save:
-                        # - Jika memecahkan rekor loss (BEST)
-                        # - ATAU Jika secara fisik sukses DAN loss-nya wajar (ACCEPTABLE)
-                        should_save = False
-                        status_label = ""
-                        
-                        if current_cube_loss < best_loss:
+                        if is_new_best:
+                            best_score = current_cube_score
                             best_loss = current_cube_loss
-                            should_save = True
-                            status_label = "NEW RECORD!"
-                            save_col = rl.GREEN
-                        elif is_physically_good and current_cube_loss < ACCEPTABLE_LOSS:
-                            should_save = True
-                            status_label = "GOOD ENOUGH (Saved)"
-                            save_col = rl.BLUE
-                        else:
-                            save_msg = f"Skipped (L:{current_cube_loss:.4f} D:{dist_phys:.2f})"
-                            save_col = rl.ORANGE
-
-                        if should_save:
-                            if np.sum(current_iter_matrix) > 0:
-                                best_display_matrix = np.copy(current_iter_matrix)
-                            
                             save_data = {
                                 'model_state_dict': net.state_dict(),
                                 'best_loss': best_loss,
-                                'best_cm': best_display_matrix
+                                'best_score': best_score
                             }
                             torch.save(save_data, MODEL_PATH)
-                            save_msg = f"{status_label} Loss: {current_cube_loss:.5f}"
-
+                            save_msg = f"SAVED! {reason}"
+                            save_col = rl.GREEN
+                        else:
+                            save_msg = f"Learning... (Loss: {current_cube_loss:.4f})"
+                            save_col = rl.ORANGE
+                    
                     cube_data_X = []
                     cube_data_Y = []
                     is_training_moment = False
-                    update_dashboard(iteration, best_loss)
+                    
+                    # Update Grafik
+                    update_dashboard(iteration, best_score, current_iter_matrix, total_confusion_matrix)
                 
                 continue 
 
-            # --- LOGIKA FISIKA ---
-            
+            # --- PHYSICS PHASE ---
             if target_cube_idx == -1:
                 found_task = False
                 for i, c in enumerate(cubes):
@@ -345,7 +327,8 @@ def main():
                 
                 if not found_task:
                     cubes, slots = reset_level()
-                    current_iter_matrix = np.zeros((3, 3), dtype=int) 
+                    current_iter_matrix = np.zeros((3, 3), dtype=int) # Reset Current Matrix
+                    # Total Matrix TIDAK DI-RESET (Terakumulasi terus)
                     iteration += 1
 
             if target_cube_idx != -1 and path_idx < len(path):
@@ -353,8 +336,7 @@ def main():
                 ideal_theta = inverse_kinematics(target_xy[0], target_xy[1])
                 
                 nn_input = torch.tensor(np.concatenate([curr_theta, ideal_theta]), dtype=torch.float32)
-                with torch.no_grad():
-                    correction = net(nn_input).numpy()
+                with torch.no_grad(): correction = net(nn_input).numpy()
                 
                 command_theta = ideal_theta + correction
                 actual_theta = apply_gravity_disturbance(command_theta[0], command_theta[1])
@@ -373,7 +355,6 @@ def main():
                     
             elif target_cube_idx != -1 and path_idx >= len(path):
                 cube = cubes[target_cube_idx]
-                
                 if cube["state"] == "IDLE": 
                     cube["state"] = "GRIPPED"
                     grip_active = True
@@ -381,32 +362,32 @@ def main():
                     dest_pos = slots[target_slot_idx]["pos"]
                     path = generate_smooth_path(curr_pos, dest_pos, steps=60)
                     path_idx = 0
-                    
                 elif cube["state"] == "GRIPPED":
                     cube["state"] = "DONE"
                     grip_active = False
                     
-                    last_final_pos = cube["pos"]
-                    last_target_pos = slots[target_slot_idx]["pos"]
+                    final_x, final_y = cube["pos"]
+                    target_x, target_y = slots[target_slot_idx]["pos"]
+                    dist_error = math.sqrt((final_x - target_x)**2 + (final_y - target_y)**2)
+                    current_cube_score = max(0, (0.15 - dist_error) * (100 / 0.15))
+                    total_score_iter += current_cube_score
                     
-                    dist_error = math.sqrt((last_final_pos[0] - last_target_pos[0])**2 + 
-                                           (last_final_pos[1] - last_target_pos[1])**2)
-                    reward = max(0, (0.15 - dist_error) * (100 / 0.15))
-                    history_score.append(reward)
-                    
-                    act_idx = COLOR_MAP[cube["color"]]
+                    # --- UPDATE MATRIX ---
+                    actual_idx = COLOR_MAP[cube["color"]]
                     pred_idx = -1
                     for s_check in slots:
                         sx, sy = s_check["pos"]
-                        d = math.sqrt((last_final_pos[0] - sx)**2 + (last_final_pos[1] - sy)**2)
+                        d = math.sqrt((final_x - sx)**2 + (final_y - sy)**2)
                         if d < 0.12: 
                             pred_idx = COLOR_MAP[s_check["color"]]
                             s_check["filled"] = True 
                             break
                     if pred_idx != -1:
-                        current_iter_matrix[act_idx][pred_idx] += 1
-                    slots[target_slot_idx]["filled"] = True 
+                        # Update BOTH matrices
+                        current_iter_matrix[actual_idx][pred_idx] += 1
+                        total_confusion_matrix[actual_idx][pred_idx] += 1
                     
+                    slots[target_slot_idx]["filled"] = True 
                     target_cube_idx = -1; target_slot_idx = -1
                     is_training_moment = True
                     train_moment_timer = 0

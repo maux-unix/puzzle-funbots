@@ -6,21 +6,21 @@ import torch
 import torch.nn as nn
 import os
 
-# --- KONFIGURASI ---
+# --- KONFIGURASI TEST ---
 SCREEN_WIDTH = 800
 SCREEN_HEIGHT = 600
 BASE_POS = (400, 550) 
 PIXELS_PER_METER = 200.0
 
-# Nama file model yang akan dites (Pastikan file ini ada!)
+# Nama Model yang akan di-load
 MODEL_PATH = "ilc_online_learner.pth" 
+
+# --- SETTING GRAVITASI: Sesuain dengan Model ---
+GRAVITY_VAL = 0.20
 
 # Fisika Robot
 LINK_1 = 1.2 
 LINK_2 = 1.0 
-GRAVITY_VAL = 0.20 # Gravitasi harus SAMA dengan saat training untuk melihat hasilnya
-
-# Network Param
 HIDDEN_SIZE = 64
 
 # Warna
@@ -28,13 +28,13 @@ COLOR_BG = (30, 30, 30, 255)
 COLOR_ROBOT = (220, 220, 220, 255)
 COLOR_GHOST = (0, 255, 0, 100)
 COLOR_JOINT = (50, 50, 50, 255)
-COLOR_RED = (230, 41, 55, 255)
-COLOR_BLUE = (0, 121, 241, 255)
-COLOR_YELLOW = (253, 249, 0, 255)
+RED_RGB = (230, 41, 55, 255)
+BLUE_RGB = (0, 121, 241, 255)
+YELLOW_RGB = (253, 249, 0, 255)
 COLOR_SLOT_BG = (60, 60, 60, 255)
 COLOR_GRIP = (50, 255, 50, 255)
 
-# --- 1. NEURAL NETWORK (Arsitektur HARUS SAMA) ---
+# --- 1. NEURAL NETWORK (Arsitektur Harus Sama) ---
 class ILCNetwork(nn.Module):
     def __init__(self):
         super(ILCNetwork, self).__init__()
@@ -48,7 +48,7 @@ class ILCNetwork(nn.Module):
         x = self.relu(self.fc2(x))
         return self.fc3(x)
 
-# --- 2. FISIKA & KINEMATIKA ---
+# --- 2. KINEMATIKA ---
 def forward_kinematics(theta1, theta2):
     x1 = LINK_1 * math.cos(theta1)
     y1 = LINK_1 * math.sin(theta1)
@@ -80,47 +80,44 @@ def world_to_screen(x, y):
     py = BASE_POS[1] - (y * PIXELS_PER_METER)
     return int(px), int(py)
 
-def apply_gravity_disturbance(theta1, theta2):
-    # Simulasi gangguan yang sama persis
+def apply_physics(theta1, theta2):
+    # Simulasi Gangguan (Di sini dinonaktifkan / 0.0)
     act_t1 = float(theta1) - (GRAVITY_VAL * math.cos(theta1)) 
     act_t2 = float(theta2) - (GRAVITY_VAL * 0.5 * math.cos(theta1 + theta2))
     return np.array([act_t1, act_t2], dtype=np.float32)
 
-# --- 3. LOGIKA UTAMA ---
+# --- 3. MAIN TEST LOOP ---
 def main():
-    rl.init_window(SCREEN_WIDTH, SCREEN_HEIGHT, "TEST MODE: Neural ILC")
+    rl.init_window(SCREEN_WIDTH, SCREEN_HEIGHT, "2D Neural ILC - TEST MODE")
     rl.set_target_fps(60)
     
-    # Init & Load Model
+    # Init Neural Network
     net = ILCNetwork()
     model_loaded = False
     
+    # Load Model
     if os.path.exists(MODEL_PATH):
         try:
             checkpoint = torch.load(MODEL_PATH)
-            # Handle format save yang berbeda (dict vs state_dict langsung)
+            # Handle format dict vs state_dict
             if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
                 net.load_state_dict(checkpoint['model_state_dict'])
-                print(f"Model Loaded. Best Loss saat training: {checkpoint.get('best_loss', 'N/A')}")
             else:
                 net.load_state_dict(checkpoint)
             
-            net.eval() # PENTING: Set ke mode evaluasi (matikan dropout/batchnorm jika ada)
+            net.eval() # Matikan mode training (penting!)
             model_loaded = True
+            print(f"SUKSES: Model '{MODEL_PATH}' dimuat.")
         except Exception as e:
-            print(f"Gagal load model: {e}")
+            print(f"ERROR: Gagal memuat model. {e}")
     else:
-        print(f"File {MODEL_PATH} tidak ditemukan! Pastikan sudah training dulu.")
+        print(f"PERINGATAN: File '{MODEL_PATH}' tidak ditemukan!")
 
     curr_theta = np.array([math.pi / 2, 0.0])
     
-    # Statistik Test
-    total_cubes = 0
-    success_cubes = 0
-    
     def reset_level():
         c_list = []
-        cols = [COLOR_RED]*3 + [COLOR_BLUE]*3 + [COLOR_YELLOW]*3
+        cols = [RED_RGB]*3 + [BLUE_RGB]*3 + [YELLOW_RGB]*3
         random.shuffle(cols)
         for i in range(9):
             r, c = i // 3, i % 3
@@ -129,7 +126,7 @@ def main():
             c_list.append({"pos": [cx, cy], "color": cols[i], "state": "IDLE"})
             
         s_list = []
-        s_cols = [COLOR_RED]*3 + [COLOR_BLUE]*3 + [COLOR_YELLOW]*3
+        s_cols = [RED_RGB]*3 + [BLUE_RGB]*3 + [YELLOW_RGB]*3
         random.shuffle(s_cols) 
         idx = 0
         for r in range(3):
@@ -148,7 +145,7 @@ def main():
     path_idx = 0
     grip_active = False
     
-    def generate_smooth_path(start_xy, end_xy, steps=50):
+    def generate_smooth_path(start_xy, end_xy, steps=60):
         pts = []
         for i in range(steps):
             t = i / steps
@@ -161,11 +158,10 @@ def main():
 
     while not rl.window_should_close():
         
-        # Speed Control
-        speed_multiplier = 5 if rl.is_key_down(rl.KEY_SPACE) else 1
+        # Speed Control (Spasi untuk Turbo)
+        speed = 5 if rl.is_key_down(rl.KEY_SPACE) else 1
         
-        for _ in range(speed_multiplier):
-            
+        for _ in range(speed):
             # 1. Cari Tugas
             if target_cube_idx == -1:
                 found_task = False
@@ -176,34 +172,34 @@ def main():
                                 target_cube_idx = i
                                 target_slot_idx = j
                                 rob_pos = forward_kinematics(curr_theta[0], curr_theta[1])[1]
-                                path = generate_smooth_path(rob_pos, c["pos"], steps=40)
+                                path = generate_smooth_path(rob_pos, c["pos"], steps=60)
                                 path_idx = 0
                                 found_task = True
                                 break
                         if found_task: break
                 
                 if not found_task:
-                    cubes, slots = reset_level() # Reset level jika habis
+                    cubes, slots = reset_level() # Loop selamanya
 
-            # 2. Eksekusi Gerakan (INFERENCE)
+            # 2. Eksekusi Gerakan (INFERENCE ONLY)
             if target_cube_idx != -1 and path_idx < len(path):
                 target_xy = path[path_idx]
                 
                 # A. Hitung Target Ideal
                 ideal_theta = inverse_kinematics(target_xy[0], target_xy[1])
                 
-                # B. MINTA KOREKSI DARI MODEL (Jika ada)
+                # B. Minta Koreksi dari Model (Jika Ada)
                 correction = np.array([0.0, 0.0])
                 if model_loaded:
                     nn_input = torch.tensor(np.concatenate([curr_theta, ideal_theta]), dtype=torch.float32)
-                    with torch.no_grad(): # MATIKAN GRADIENT (Hemat memori, mode test)
+                    with torch.no_grad():
                         correction = net(nn_input).numpy()
                 
-                # C. Command + Disturbance
+                # C. Command = Ideal + Learned Correction
                 command_theta = ideal_theta + correction
                 
-                # D. Simulasi Gangguan (Gravitasi tetap ada!)
-                actual_theta = apply_gravity_disturbance(command_theta[0], command_theta[1])
+                # D. Fisika (Tanpa Gravitasi / 0.0)
+                actual_theta = apply_physics(command_theta[0], command_theta[1])
                 
                 curr_theta = actual_theta
                 
@@ -225,31 +221,19 @@ def main():
                     path_idx = 0
                 elif cube["state"] == "GRIPPED":
                     cube["state"] = "DONE"
+                    slots[target_slot_idx]["filled"] = True
                     grip_active = False
-                    slots[target_slot_idx]["filled"] = True 
-                    
-                    # Hitung Statistik Sukses
-                    final_x, final_y = cube["pos"]
-                    target_x, target_y = slots[target_slot_idx]["pos"]
-                    dist_error = math.sqrt((final_x - target_x)**2 + (final_y - target_y)**2)
-                    
-                    total_cubes += 1
-                    # Jika error < 5cm, anggap sukses masuk kotak
-                    if dist_error < 0.05:
-                        success_cubes += 1
-                    
                     target_cube_idx = -1; target_slot_idx = -1
 
         # --- RENDER ---
         rl.begin_drawing()
         rl.clear_background(COLOR_BG)
         
-        # Slots
+        # Slots & Cubes
         for s in slots:
             sx, sy = world_to_screen(s["pos"][0], s["pos"][1])
             rl.draw_rectangle(sx-20, sy-20, 40, 40, COLOR_SLOT_BG)
             rl.draw_rectangle_lines_ex(rl.Rectangle(sx-20, sy-20, 40, 40), 2, s["color"])
-        # Cubes
         for c in cubes:
             cx, cy = world_to_screen(c["pos"][0], c["pos"][1])
             rl.draw_rectangle(cx-14, cy-14, 28, 28, c["color"])
@@ -267,22 +251,14 @@ def main():
         rl.draw_line_ex(j2_xy, j3_xy, 6, COLOR_ROBOT)
         rl.draw_circle_v(j3_xy, 8, COLOR_GRIP if grip_active else rl.WHITE)
         
-        # --- UI TEST ---
-        if model_loaded:
-            rl.draw_text("MODE: TESTING (INFERENCE)", 10, 10, 20, rl.GREEN)
-        else:
-            rl.draw_text("MODE: NO MODEL (GRAVITY ERROR)", 10, 10, 20, rl.RED)
-            
-        rl.draw_text(f"Processed: {total_cubes}", 10, 40, 20, rl.WHITE)
+        # --- UI INFO ---
+        # Tampilkan Nama Model di Layar
+        text_color = rl.GREEN if model_loaded else rl.RED
+        status_text = f"Using Model: {MODEL_PATH}" if model_loaded else "NO MODEL LOADED (Manual Only)"
+        rl.draw_text(status_text, 10, 10, 20, text_color)
         
-        acc = 0.0
-        if total_cubes > 0:
-            acc = (success_cubes / total_cubes) * 100.0
-            
-        col_acc = rl.GREEN if acc > 90 else (rl.YELLOW if acc > 70 else rl.RED)
-        rl.draw_text(f"Accuracy: {acc:.1f}%", 10, 65, 20, col_acc)
-        
-        rl.draw_text("Space: Turbo", SCREEN_WIDTH - 150, 10, 20, rl.GRAY)
+        rl.draw_text(f"Gravity: {GRAVITY_VAL}", 10, 35, 20, rl.YELLOW)
+        rl.draw_text("Space: Fast Forward", SCREEN_WIDTH - 200, 10, 20, rl.GRAY)
         
         rl.end_drawing()
 
