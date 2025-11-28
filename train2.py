@@ -6,6 +6,8 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import os
+import matplotlib.pyplot as plt
+from matplotlib.gridspec import GridSpec
 
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 #device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
@@ -55,8 +57,7 @@ COLORS_NUM = [
 
 # skor teori: 9 cube * max 100
 MAX_SCORE_THEORETICAL = 9 * 100.0
-THRESHOLD_PUZZLE = 0.9 * MAX_SCORE_THEORETICAL  # 90% dari skor maksimal
-
+THRESHOLD_PUZZLE = 0.80 * MAX_SCORE_THEORETICAL  # 75% dari skor maksimal
 
 # --- 1. NEURAL NETWORK ---
 class PuzzleNet(nn.Module):
@@ -151,7 +152,14 @@ def apply_physical_constraints(theta1, theta2):
 
 # --- 3. PLOT ERROR DI RAYLIB ---
 
+# --- CONFUSION MATRIX & HISTORY ---
+NUM_CLASSES = 9  # angka 1..9
+
+# Matrix total (akumulasi semua episode)
+total_conf_matrix = np.zeros((NUM_CLASSES, NUM_CLASSES), dtype=int)
+
 hist_error = []  # average positional error per iteration
+hist_accuracy = []   # akurasi (dari total_conf_matrix) per iterasi training
 
 def draw_error_plot(hist_error):
     """Plot sederhana error gerakan per iterasi di pojok kiri bawah."""
@@ -208,6 +216,114 @@ def draw_error_plot(hist_error):
     txt = f"Last Err: {hist_error[-1]:.4f}"
     rl.draw_text(txt, PLOT_X + 5, PLOT_Y + 5, 14, rl.LIGHTGRAY)
 
+def update_confusion_for_cube(cubes, slots, cube_index):
+    """
+    Update confusion matrix TOTAL saat satu cube selesai diletakkan.
+    - True label  : angka cube (1..9)
+    - Pred label  : angka slot yang paling dekat dengan posisi akhir cube.
+    """
+    global total_conf_matrix
+
+    cube = cubes[cube_index]
+    true_val = cube["val"]    # 1..9
+    true_idx = true_val - 1   # 0..8
+
+    fx, fy = cube["pos"]
+    pred_val = None
+    min_d = 1e9
+
+    # Cari slot terdekat dari posisi akhir kubus
+    for s in slots:
+        sx, sy = s["pos"]
+        d = math.dist((fx, fy), (sx, sy))
+        if d < min_d:
+            min_d = d
+            pred_val = s["val"]
+
+    if pred_val is None:
+        return
+
+    pred_idx = pred_val - 1
+    total_conf_matrix[true_idx, pred_idx] += 1
+
+def compute_accuracy_from_cm(cm: np.ndarray) -> float:
+    total = cm.sum()
+    if total == 0:
+        return 0.0
+    return float(np.trace(cm)) / float(total) * 100.0
+
+
+def save_training_summary(iteration: int):
+    """
+    Simpan 1 gambar PNG berisi:
+      - plot akurasi (total_conf_matrix) vs iterasi,
+      - plot avg error vs iterasi,
+      - confusion matrix TOTAL.
+    """
+    os.makedirs("training_logs", exist_ok=True)
+
+    fig = plt.figure(figsize=(10, 8))
+    gs = GridSpec(2, 2, figure=fig)
+
+    ax_acc = fig.add_subplot(gs[0, 0])
+    ax_err = fig.add_subplot(gs[0, 1])
+    ax_cm  = fig.add_subplot(gs[1, :])
+
+    # --- Plot Akurasi ---
+    if hist_accuracy:
+        iters = np.arange(1, len(hist_accuracy) + 1)
+        ax_acc.plot(iters, hist_accuracy, marker="o")
+        ax_acc.set_title("Accuracy dari Confusion Matrix (Total)")
+        ax_acc.set_xlabel("Iteration")
+        ax_acc.set_ylabel("Accuracy (%)")
+        ax_acc.grid(True, alpha=0.3)
+    else:
+        ax_acc.set_title("Accuracy (Belum ada data)")
+        ax_acc.axis("off")
+
+    # --- Plot Error ---
+    if hist_error:
+        iters_e = np.arange(1, len(hist_error) + 1)
+        ax_err.plot(iters_e, hist_error, marker="o", color="red")
+        ax_err.set_title("Average Positional Error per Iteration")
+        ax_err.set_xlabel("Iteration")
+        ax_err.set_ylabel("Error (meter)")
+        ax_err.grid(True, alpha=0.3)
+    else:
+        ax_err.set_title("Error (Belum ada data)")
+        ax_err.axis("off")
+
+    # --- Confusion Matrix TOTAL ---
+    cm = total_conf_matrix
+    im = ax_cm.imshow(cm, cmap="Blues", vmin=0)
+
+    acc_total = compute_accuracy_from_cm(cm)
+    ax_cm.set_title(f"Total Confusion Matrix (Acc: {acc_total:.1f}%)")
+    ax_cm.set_xlabel("Predicted")
+    ax_cm.set_ylabel("Actual")
+
+    tick_labels = [str(i + 1) for i in range(NUM_CLASSES)]
+    ax_cm.set_xticks(np.arange(NUM_CLASSES))
+    ax_cm.set_yticks(np.arange(NUM_CLASSES))
+    ax_cm.set_xticklabels(tick_labels)
+    ax_cm.set_yticklabels(tick_labels)
+
+    max_val = cm.max() if cm.size > 0 else 0
+    for i in range(NUM_CLASSES):
+        for j in range(NUM_CLASSES):
+            v = int(cm[i, j])
+            if v > 0:
+                color = "white" if max_val > 0 and v > max_val / 2 else "black"
+                ax_cm.text(j, i, str(v), ha="center", va="center",
+                           color=color, fontsize=8)
+
+    fig.colorbar(im, ax=ax_cm, fraction=0.046, pad=0.04)
+
+    plt.tight_layout()
+    out_path = os.path.join("training_logs", f"summary_iter_{iteration}.png")
+    fig.savefig(out_path)
+    plt.close(fig)
+    print(f"[TRAIN] Saved summary plot: {out_path}")
 
 # --- 4. GENERATOR SUDOKU 3x3 (PERMUTASI 1..9) ---
 
@@ -487,6 +603,9 @@ def main():
                         last_cube_score = scr
                         total_score_iter += scr
 
+                        # --- UPDATE CONFUSION MATRIX TOTAL UNTUK KUBUS INI ---
+                        update_confusion_for_cube(cubes, slots, active_idx)
+
                         active_idx = -1
 
                     path_idx += 1
@@ -533,6 +652,9 @@ def main():
                             # Catat error iterasi ini
                             hist_error.append(avg_err_iter)
 
+                            acc_total = compute_accuracy_from_cm(total_conf_matrix) # [BARU]
+                            hist_accuracy.append(acc_total)                         # [BARU]
+
                             # Update best score untuk layout ini
                             nonlocal_puzzle_best = total_score_iter
                             # python nggak boleh assign langsung outer var di scope ini,
@@ -547,23 +669,29 @@ def main():
                                 'score': total_score_iter,
                                 'iteration': iteration,
                                 'avg_error': avg_err_iter,
+                                'acc_total': acc_total,                            # [BARU]
                             }
                             torch.save(latest_state, MODEL_LATEST_PATH)
 
                             # Update & simpan model terbaik (global)
                             if total_score_iter > global_best_score:
                                 global_best_score = total_score_iter
+                                save_training_summary(iteration)                        # [BARU]
                                 best_state = {
                                     'model': net.state_dict(),
                                     'score': global_best_score,
                                     'iteration': iteration,
                                     'avg_error': avg_err_iter,
+                                    'acc_total': acc_total,                        # [BARU]
                                 }
                                 torch.save(best_state, MODEL_BEST_PATH)
                                 save_msg = f"NEW GLOBAL BEST! Score: {global_best_score:.1f}"
                                 save_col = rl.GREEN
                             else:
-                                save_msg = f"Learning... (S:{total_score_iter:.1f}, E:{avg_err_iter:.4f})"
+                                save_msg = (
+                                    f"Learning... (S:{total_score_iter:.1f}, "
+                                    f"E:{avg_err_iter:.4f}, Acc:{acc_total:.1f}%)" # [BARU]
+                                )
                                 save_col = rl.ORANGE
 
                     # --- UPDATE puzzle_best_score & CEK THRESHOLD 0.9 ---

@@ -1,4 +1,3 @@
-import pyray as rl
 import math
 import random
 import numpy as np
@@ -6,59 +5,91 @@ import torch
 import torch.nn as nn
 import os
 
-# --- KONFIGURASI TEST ---
-SCREEN_WIDTH = 800
-SCREEN_HEIGHT = 600
-BASE_POS = (400, 550) 
-PIXELS_PER_METER = 200.0
+# ==========================
+#   KONFIGURASI DASAR
+# ==========================
 
-# Nama Model yang akan di-load
-MODEL_PATH = "ilc_online_learner.pth" 
-
-# --- SETTING GRAVITASI: Sesuain dengan Model ---
-GRAVITY_VAL = 0.20
+# Penyimpanan model
+MODEL_BEST_PATH   = "ilc_3x3_best.pth"     # model dengan skor terbaik (global)
+# Kalau mau tes model terakhir:
+# MODEL_BEST_PATH = "ilc_3x3_latest.pth"
 
 # Fisika Robot
-LINK_1 = 1.2 
-LINK_2 = 1.0 
-HIDDEN_SIZE = 64
+LINK_1 = 1.2
+LINK_2 = 1.0
 
-# Warna
-COLOR_BG = (30, 30, 30, 255)
-COLOR_ROBOT = (220, 220, 220, 255)
-COLOR_GHOST = (0, 255, 0, 100)
-COLOR_JOINT = (50, 50, 50, 255)
-RED_RGB = (230, 41, 55, 255)
-BLUE_RGB = (0, 121, 241, 255)
-YELLOW_RGB = (253, 249, 0, 255)
-COLOR_SLOT_BG = (60, 60, 60, 255)
-COLOR_GRIP = (50, 255, 50, 255)
+# Batas ruang gerak (sama dengan script utama)
+SAFE_MIN_X = -1.8
+SAFE_MAX_X =  1.8
+SAFE_MIN_Y = -0.8
+SAFE_MAX_Y =  1.5
 
-# --- 1. NEURAL NETWORK (Arsitektur Harus Sama) ---
-class ILCNetwork(nn.Module):
+HIDDEN_SIZE = 128
+MAX_SCORE_THEORETICAL = 9 * 100.0  # 9 cube * max 100
+
+STEPS_TRAVEL   = 30
+STEPS_APPROACH = 60
+STEPS_WAIT     = 60
+
+
+# ==========================
+#   DEVICE HELPER (CPU / CUDA / MPS)
+# ==========================
+
+def get_device():
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    # Metal (MPS) di Mac
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+# ==========================
+#   MODEL (SAMA DENGAN TRAINING)
+# ==========================
+
+class PuzzleNet(nn.Module):
     def __init__(self):
-        super(ILCNetwork, self).__init__()
+        super(PuzzleNet, self).__init__()
         self.fc1 = nn.Linear(4, HIDDEN_SIZE)
+        self.ln1 = nn.LayerNorm(HIDDEN_SIZE)
         self.fc2 = nn.Linear(HIDDEN_SIZE, HIDDEN_SIZE)
+        self.ln2 = nn.LayerNorm(HIDDEN_SIZE)
         self.fc3 = nn.Linear(HIDDEN_SIZE, 2)
-        self.relu = nn.ReLU()
-        
-    def forward(self, x):
-        x = self.relu(self.fc1(x))
-        x = self.relu(self.fc2(x))
-        return self.fc3(x)
+        self.relu = nn.LeakyReLU(0.1)
 
-# --- 2. KINEMATIKA ---
+        nn.init.xavier_uniform_(self.fc1.weight)
+        nn.init.xavier_uniform_(self.fc2.weight)
+        nn.init.xavier_uniform_(self.fc3.weight)
+
+    def forward(self, x):
+        x = self.relu(self.ln1(self.fc1(x)))
+        x = self.relu(self.ln2(self.fc2(x)))
+        return self.fc3(x)  # (.., 2) -> [theta1, theta2]
+
+
+# ==========================
+#   KINEMATIKA & KONSTRAIN
+# ==========================
+
+def safe_theta(theta: np.ndarray) -> np.ndarray:
+    if np.isnan(theta).any() or np.isinf(theta).any():
+        return np.array([math.pi / 2, 0.0], dtype=np.float32)
+    return theta.astype(np.float32)
+
 def forward_kinematics(theta1, theta2):
+    theta1 = float(theta1)
+    theta2 = float(theta2)
     x1 = LINK_1 * math.cos(theta1)
     y1 = LINK_1 * math.sin(theta1)
     x2 = x1 + LINK_2 * math.cos(theta1 + theta2)
     y2 = y1 + LINK_2 * math.sin(theta1 + theta2)
-    return (float(x1), float(y1)), (float(x2), float(y2))
+    return (x1, y1), (x2, y2)
 
 def inverse_kinematics(target_x, target_y):
     dist = math.sqrt(target_x**2 + target_y**2)
-    max_reach = LINK_1 + LINK_2
+    max_reach = LINK_1 + LINK_2 - 0.01
     if dist > max_reach:
         scale = max_reach / dist
         target_x *= scale
@@ -71,198 +102,304 @@ def inverse_kinematics(target_x, target_y):
         k1 = LINK_1 + LINK_2 * math.cos(theta2)
         k2 = LINK_2 * math.sin(theta2)
         theta1 = math.atan2(target_y, target_x) - math.atan2(k2, k1)
-        return np.array([float(theta1), float(theta2)], dtype=np.float32)
-    except:
-        return np.array([math.pi/2, 0], dtype=np.float32)
+        return np.array([theta1, theta2], dtype=np.float32)
+    except Exception:
+        return None
 
-def world_to_screen(x, y):
-    px = BASE_POS[0] + (x * PIXELS_PER_METER)
-    py = BASE_POS[1] - (y * PIXELS_PER_METER)
-    return int(px), int(py)
+def apply_physical_constraints(theta1, theta2):
+    _, hand_pos = forward_kinematics(theta1, theta2)
+    curr_x, curr_y = hand_pos
 
-def apply_physics(theta1, theta2):
-    # Simulasi Gangguan (Di sini dinonaktifkan / 0.0)
-    act_t1 = float(theta1) - (GRAVITY_VAL * math.cos(theta1)) 
-    act_t2 = float(theta2) - (GRAVITY_VAL * 0.5 * math.cos(theta1 + theta2))
-    return np.array([act_t1, act_t2], dtype=np.float32)
+    clamped_x = curr_x
+    clamped_y = curr_y
+    hit_wall = False
 
-# --- 3. MAIN TEST LOOP ---
-def main():
-    rl.init_window(SCREEN_WIDTH, SCREEN_HEIGHT, "2D Neural ILC - TEST MODE")
-    rl.set_target_fps(60)
-    
-    # Init Neural Network
-    net = ILCNetwork()
-    model_loaded = False
-    
-    # Load Model
-    if os.path.exists(MODEL_PATH):
-        try:
-            checkpoint = torch.load(MODEL_PATH)
-            # Handle format dict vs state_dict
-            if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-                net.load_state_dict(checkpoint['model_state_dict'])
+    if curr_x > SAFE_MAX_X:
+        clamped_x = SAFE_MAX_X
+        hit_wall = True
+    if curr_x < SAFE_MIN_X:
+        clamped_x = SAFE_MIN_X
+        hit_wall = True
+    if curr_y < SAFE_MIN_Y:
+        clamped_y = SAFE_MIN_Y
+        hit_wall = True
+    if curr_y > SAFE_MAX_Y:
+        clamped_y = SAFE_MAX_Y
+        hit_wall = True
+
+    if hit_wall:
+        corrected = inverse_kinematics(clamped_x, clamped_y)
+        if corrected is not None:
+            return safe_theta(corrected)
+
+    return np.array([theta1, theta2], dtype=np.float32)
+
+
+# ==========================
+#   LAYOUT SUDOKU & TRAJECTORY
+# ==========================
+
+def generate_valid_sudoku_3x3():
+    """Permutasi 1..9 acak."""
+    nums = list(range(1, 10))
+    random.shuffle(nums)
+    return nums
+
+def build_puzzle(left_vals, right_vals):
+    """
+    Kiri: cubes (1..9 acak)
+    Kanan: slots yang meminta angka right_vals[i]
+    Balik: cubes, slots
+      - cubes[i] : {val, pos[x,y], target_slot_id}
+      - slots[j] : {val, pos[x,y]}
+    """
+    cubes = []
+    slots = []
+
+    spacing_src = 0.18
+    spacing_tgt = 0.22
+
+    src_cx, src_cy = -0.9, 0.0
+    tgt_cx, tgt_cy =  0.95, 0.0
+
+    # mapping nilai -> index slot
+    val_to_slot_idx = {v: i for i, v in enumerate(right_vals)}
+
+    # cubes kiri
+    for i in range(9):
+        val = left_vals[i]
+        r = i // 3
+        c = i % 3
+
+        off_x = (c - 1) * spacing_src
+        off_y = (1 - r) * spacing_src
+
+        cx = src_cx + off_x
+        cy = src_cy + off_y
+
+        cubes.append({
+            "val": val,
+            "pos": [cx, cy],
+            "target_slot_id": val_to_slot_idx[val],
+        })
+
+    # slots kanan
+    for i in range(9):
+        val = right_vals[i]
+        r = i // 3
+        c = i % 3
+
+        off_x = (c - 1) * spacing_tgt
+        off_y = (1 - r) * spacing_tgt
+
+        sx = tgt_cx + off_x
+        sy = tgt_cy + off_y
+
+        slots.append({
+            "val": val,
+            "pos": [sx, sy],
+        })
+
+    # sort cubes by nilai (1..9)
+    cubes.sort(key=lambda x: x["val"])
+    return cubes, slots
+
+def generate_dynamic_trajectory(current_hand_pos, pickup_pos, drop_pos):
+    """
+    Sama konsep dengan di training:
+    naik ke SAFE_HEIGHT, ke X cube, turun, hold, naik, ke X slot, turun, hold, naik.
+    Balik: joint_traj (list [theta1,theta2]) dan grip_sched (0/1).
+    """
+    traj = []
+    grip = []
+
+    SAFE_HEIGHT = 0.5
+    PICK_Y = pickup_pos[1] + 0.05
+    DROP_Y = drop_pos[1] + 0.05
+
+    points_config = [
+        ([current_hand_pos[0], SAFE_HEIGHT], 0, STEPS_APPROACH),
+        ([pickup_pos[0], SAFE_HEIGHT],       0, STEPS_TRAVEL),
+        ([pickup_pos[0], PICK_Y],            0, STEPS_APPROACH),
+        ([pickup_pos[0], PICK_Y],            1, STEPS_WAIT),
+        ([pickup_pos[0], SAFE_HEIGHT],       1, STEPS_APPROACH),
+        ([drop_pos[0], SAFE_HEIGHT],         1, STEPS_TRAVEL),
+        ([drop_pos[0], DROP_Y],              1, STEPS_APPROACH),
+        ([drop_pos[0], DROP_Y],              0, STEPS_WAIT),
+        ([drop_pos[0], SAFE_HEIGHT],         0, STEPS_APPROACH),
+    ]
+
+    curr_pos = current_hand_pos
+    curr_grip = 0
+
+    for target_pos, target_grip, steps in points_config:
+        for s in range(steps):
+            alpha = s / max(1, steps)
+            pos_x = curr_pos[0] * (1 - alpha) + target_pos[0] * alpha
+            pos_y = curr_pos[1] * (1 - alpha) + target_pos[1] * alpha
+
+            ik = inverse_kinematics(pos_x, pos_y)
+            if ik is not None:
+                traj.append(ik)
             else:
-                net.load_state_dict(checkpoint)
-            
-            net.eval() # Matikan mode training (penting!)
-            model_loaded = True
-            print(f"SUKSES: Model '{MODEL_PATH}' dimuat.")
-        except Exception as e:
-            print(f"ERROR: Gagal memuat model. {e}")
-    else:
-        print(f"PERINGATAN: File '{MODEL_PATH}' tidak ditemukan!")
+                # fallback: pakai konfigurasi sebelumnya
+                if len(traj) > 0:
+                    traj.append(traj[-1].copy())
+                else:
+                    traj.append(np.array([-math.pi / 2, 0.0], dtype=np.float32))
 
-    curr_theta = np.array([math.pi / 2, 0.0])
-    
-    def reset_level():
-        c_list = []
-        cols = [RED_RGB]*3 + [BLUE_RGB]*3 + [YELLOW_RGB]*3
-        random.shuffle(cols)
-        for i in range(9):
-            r, c = i // 3, i % 3
-            cx = -1.8 + (c * 0.25)
-            cy = 0.5 + (r * 0.25)
-            c_list.append({"pos": [cx, cy], "color": cols[i], "state": "IDLE"})
-            
-        s_list = []
-        s_cols = [RED_RGB]*3 + [BLUE_RGB]*3 + [YELLOW_RGB]*3
-        random.shuffle(s_cols) 
-        idx = 0
-        for r in range(3):
-            for c in range(3):
-                sx = 1.0 + (c * 0.25)
-                sy = 1.0 - (r * 0.25)
-                s_list.append({"pos": [sx, sy], "color": s_cols[idx], "filled": False})
-                idx += 1
-        return c_list, s_list
+            if steps == STEPS_WAIT:
+                grip.append(target_grip)
+            else:
+                grip.append(curr_grip if alpha < 0.5 else target_grip)
 
-    cubes, slots = reset_level()
-    
-    target_cube_idx = -1
-    target_slot_idx = -1
-    path = []
-    path_idx = 0
-    grip_active = False
-    
-    def generate_smooth_path(start_xy, end_xy, steps=60):
-        pts = []
-        for i in range(steps):
-            t = i / steps
-            lx = start_xy[0] * (1-t) + end_xy[0] * t
-            ly = start_xy[1] * (1-t) + end_xy[1] * t
-            arc = 0.6 * math.sin(t * math.pi)
-            pts.append([lx, ly + arc])
-        pts.append(end_xy)
-        return pts
+        curr_pos = target_pos
+        curr_grip = target_grip
 
-    while not rl.window_should_close():
-        
-        # Speed Control (Spasi untuk Turbo)
-        speed = 5 if rl.is_key_down(rl.KEY_SPACE) else 1
-        
-        for _ in range(speed):
-            # 1. Cari Tugas
-            if target_cube_idx == -1:
-                found_task = False
-                for i, c in enumerate(cubes):
-                    if c["state"] == "IDLE":
-                        for j, s in enumerate(slots):
-                            if not s["filled"] and s["color"] == c["color"]:
-                                target_cube_idx = i
-                                target_slot_idx = j
-                                rob_pos = forward_kinematics(curr_theta[0], curr_theta[1])[1]
-                                path = generate_smooth_path(rob_pos, c["pos"], steps=60)
-                                path_idx = 0
-                                found_task = True
-                                break
-                        if found_task: break
-                
-                if not found_task:
-                    cubes, slots = reset_level() # Loop selamanya
+    return np.array(traj), grip
 
-            # 2. Eksekusi Gerakan (INFERENCE ONLY)
-            if target_cube_idx != -1 and path_idx < len(path):
-                target_xy = path[path_idx]
-                
-                # A. Hitung Target Ideal
-                ideal_theta = inverse_kinematics(target_xy[0], target_xy[1])
-                
-                # B. Minta Koreksi dari Model (Jika Ada)
-                correction = np.array([0.0, 0.0])
-                if model_loaded:
-                    nn_input = torch.tensor(np.concatenate([curr_theta, ideal_theta]), dtype=torch.float32)
-                    with torch.no_grad():
-                        correction = net(nn_input).numpy()
-                
-                # C. Command = Ideal + Learned Correction
-                command_theta = ideal_theta + correction
-                
-                # D. Fisika (Tanpa Gravitasi / 0.0)
-                actual_theta = apply_physics(command_theta[0], command_theta[1])
-                
-                curr_theta = actual_theta
-                
-                if cubes[target_cube_idx]["state"] == "GRIPPED":
-                    hand_pos = forward_kinematics(curr_theta[0], curr_theta[1])[1]
-                    cubes[target_cube_idx]["pos"] = list(hand_pos)
-                
-                path_idx += 1
-                    
-            # 3. Transisi
-            elif target_cube_idx != -1 and path_idx >= len(path):
-                cube = cubes[target_cube_idx]
-                if cube["state"] == "IDLE": 
-                    cube["state"] = "GRIPPED"
-                    grip_active = True
-                    curr_pos = forward_kinematics(curr_theta[0], curr_theta[1])[1]
-                    dest_pos = slots[target_slot_idx]["pos"]
-                    path = generate_smooth_path(curr_pos, dest_pos, steps=60)
-                    path_idx = 0
-                elif cube["state"] == "GRIPPED":
-                    cube["state"] = "DONE"
-                    slots[target_slot_idx]["filled"] = True
-                    grip_active = False
-                    target_cube_idx = -1; target_slot_idx = -1
 
-        # --- RENDER ---
-        rl.begin_drawing()
-        rl.clear_background(COLOR_BG)
-        
-        # Slots & Cubes
-        for s in slots:
-            sx, sy = world_to_screen(s["pos"][0], s["pos"][1])
-            rl.draw_rectangle(sx-20, sy-20, 40, 40, COLOR_SLOT_BG)
-            rl.draw_rectangle_lines_ex(rl.Rectangle(sx-20, sy-20, 40, 40), 2, s["color"])
-        for c in cubes:
-            cx, cy = world_to_screen(c["pos"][0], c["pos"][1])
-            rl.draw_rectangle(cx-14, cy-14, 28, 28, c["color"])
-            rl.draw_rectangle_lines(cx-14, cy-14, 28, 28, rl.BLACK)
-            
-        # Robot
-        j1_xy = BASE_POS
-        j2_m, j3_m = forward_kinematics(curr_theta[0], curr_theta[1])
-        j2_xy = world_to_screen(j2_m[0], j2_m[1])
-        j3_xy = world_to_screen(j3_m[0], j3_m[1])
-        
-        rl.draw_line_ex(j1_xy, j2_xy, 10, COLOR_ROBOT)
-        rl.draw_circle_v(j1_xy, 8, COLOR_JOINT)
-        rl.draw_circle_v(j2_xy, 7, COLOR_JOINT)
-        rl.draw_line_ex(j2_xy, j3_xy, 6, COLOR_ROBOT)
-        rl.draw_circle_v(j3_xy, 8, COLOR_GRIP if grip_active else rl.WHITE)
-        
-        # --- UI INFO ---
-        # Tampilkan Nama Model di Layar
-        text_color = rl.GREEN if model_loaded else rl.RED
-        status_text = f"Using Model: {MODEL_PATH}" if model_loaded else "NO MODEL LOADED (Manual Only)"
-        rl.draw_text(status_text, 10, 10, 20, text_color)
-        
-        rl.draw_text(f"Gravity: {GRAVITY_VAL}", 10, 35, 20, rl.YELLOW)
-        rl.draw_text("Space: Fast Forward", SCREEN_WIDTH - 200, 10, 20, rl.GRAY)
-        
-        rl.end_drawing()
+# ==========================
+#   SIMULASI 1 EPISODE (TEST)
+# ==========================
 
-    rl.close_window()
+def simulate_episode(net, device, verbose=False):
+    """
+    Simulasi 1 Sudoku penuh (9 cube) dengan:
+      - layout random kiri & kanan
+      - kontrol full oleh NN
+      - teacher trajectory hanya sebagai label & perbandingan error.
+    Balik:
+      total_score (0..900), avg_error (posisi end-effector).
+    """
+    left_vals  = generate_valid_sudoku_3x3()
+    right_vals = generate_valid_sudoku_3x3()
+    cubes, slots = build_puzzle(left_vals, right_vals)
+
+    curr_theta = np.array([-math.pi / 2, 0.0], dtype=np.float32)
+
+    total_score = 0.0
+    sum_err = 0.0
+    step_count = 0
+
+    for cube_idx in range(9):
+        cube = cubes[cube_idx]
+        cube_pos = cube["pos"][:]  # copy
+        cube_state = "IDLE"
+
+        # build trajectory
+        hand_pos = forward_kinematics(curr_theta[0], curr_theta[1])[1]
+        start_p = hand_pos
+        cube_p = cube["pos"]
+        slot_p = slots[cube["target_slot_id"]]["pos"]
+
+        joint_traj, grip_sched = generate_dynamic_trajectory(start_p, cube_p, slot_p)
+
+        # jalankan lintasan
+        for step in range(len(joint_traj)):
+            ideal_theta = joint_traj[step]
+            norm_step = step / max(1, len(joint_traj) - 1)
+            target_id_norm = cube["val"] / 10.0
+
+            nn_in = torch.tensor(
+                [norm_step, target_id_norm, 0.0, 0.0],
+                dtype=torch.float32,
+                device=device
+            ).unsqueeze(0)  # (1, 4)
+
+            net.eval()
+            with torch.no_grad():
+                cmd_abs = net(nn_in)[0].cpu().numpy()
+
+            curr_theta = safe_theta(cmd_abs)
+            curr_theta = apply_physical_constraints(curr_theta[0], curr_theta[1])
+
+            # error posisi vs ideal
+            _, ideal_pos = forward_kinematics(ideal_theta[0], ideal_theta[1])
+            _, real_pos  = forward_kinematics(curr_theta[0], curr_theta[1])
+            step_err = math.dist(ideal_pos, real_pos)
+            sum_err += step_err
+            step_count += 1
+
+            # gripper logic
+            should_grasp = grip_sched[step]
+
+            if should_grasp == 1 and cube_state == "IDLE":
+                hand_pos = forward_kinematics(curr_theta[0], curr_theta[1])[1]
+                dist_pick = math.dist(hand_pos, cube_pos)
+                if dist_pick < 0.15:
+                    cube_state = "GRIPPED"
+
+            if cube_state == "GRIPPED":
+                # cube ikut tangan
+                cube_pos = list(forward_kinematics(curr_theta[0], curr_theta[1])[1])
+
+            if should_grasp == 0 and cube_state == "GRIPPED":
+                cube_state = "DONE"
+                break
+
+        # skor cube ini
+        target_slot = slots[cube["target_slot_id"]]
+        tx, ty = target_slot["pos"]
+        fx, fy = cube_pos
+        dist_drop = math.dist((fx, fy), (tx, ty))
+        cube_score = max(0.0, (0.15 - dist_drop) * (100.0 / 0.15))
+        total_score += cube_score
+
+        if verbose:
+            print(f"  Cube {cube['val']} -> score {cube_score:.2f}")
+
+    avg_err = sum_err / max(1, step_count)
+    return total_score, avg_err
+
+
+# ==========================
+#   MAIN TEST RUN
+# ==========================
+
+def main():
+    device = get_device()
+    print("Using device:", device)
+
+    net = PuzzleNet().to(device)
+
+    if not os.path.exists(MODEL_BEST_PATH):
+        print(f"Model file '{MODEL_BEST_PATH}' tidak ditemukan.")
+        return
+
+    ckpt = torch.load(MODEL_BEST_PATH, map_location=device)
+    net.load_state_dict(ckpt['model'])
+    net.eval()
+
+    print(f"Loaded model from '{MODEL_BEST_PATH}'")
+    if 'score' in ckpt:
+        print(f"  (saved score: {ckpt['score']:.2f})")
+
+    NUM_EPISODES = 20
+
+    scores = []
+    errors = []
+
+    for ep in range(1, NUM_EPISODES + 1):
+        score, avg_err = simulate_episode(net, device, verbose=False)
+        scores.append(score)
+        errors.append(avg_err)
+        print(
+            f"[Episode {ep:02d}] "
+            f"Score = {score:.2f} / {MAX_SCORE_THEORETICAL:.1f}, "
+            f"Avg Pos Error = {avg_err:.5f}"
+        )
+
+    mean_score = sum(scores) / len(scores)
+    mean_err   = sum(errors) / len(errors)
+
+    print("\n=== SUMMARY ===")
+    print(f"Episodes        : {NUM_EPISODES}")
+    print(f"Mean Score      : {mean_score:.2f} / {MAX_SCORE_THEORETICAL:.1f}")
+    print(f"Mean Pos Error  : {mean_err:.6f}")
+    print(f"Best Episode    : {max(scores):.2f}")
+    print(f"Worst Episode   : {min(scores):.2f}")
+
 
 if __name__ == "__main__":
     main()
