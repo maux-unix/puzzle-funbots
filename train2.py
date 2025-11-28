@@ -676,7 +676,7 @@ def main():
                             # Update & simpan model terbaik (global)
                             if total_score_iter > global_best_score:
                                 global_best_score = total_score_iter
-                                save_training_summary(iteration)                        # [BARU]
+                                
                                 best_state = {
                                     'model': net.state_dict(),
                                     'score': global_best_score,
@@ -698,6 +698,7 @@ def main():
                     puzzle_best_score = max(puzzle_best_score, total_score_iter)
 
                     if puzzle_best_score >= THRESHOLD_PUZZLE:
+                        save_training_summary(iteration)                        # [BARU]
                         # Layout ini sudah >= 0.9 * max -> generate puzzle baru
                         save_msg = f"Layout SOLVED (>=90%), new puzzle..."
                         save_col = rl.SKYBLUE
